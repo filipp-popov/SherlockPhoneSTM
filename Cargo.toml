@@ -1,0 +1,21 @@
+[package]
+name = "sherlock_phone_stm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+
+[dependencies.stm32f1xx-hal]
+version = "0.11"
+features = ["stm32f103", "medium"]
+
+[profile.dev]
+codegen-units = 1
+debug = 2
+debug-assertions = true
+incremental = false
+lto = false
+opt-level = 1
