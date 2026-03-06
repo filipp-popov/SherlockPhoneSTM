@@ -85,14 +85,8 @@ fn dtmf_frequencies(key: char) -> Option<(u32, u32)> {
 
 // Test mode: output a single clean tone per key (no dual-tone multiplexing).
 const SINGLE_TONE_KEYS: bool = true;
-const NUMBER_1: &[u8] = b"5664";
-const NUMBER_2: &[u8] = b"88522222";
-const DF_ROOT_INDEX_FOR_NUMBER_1: u16 = 1;
-const DF_ROOT_INDEX_FOR_NUMBER_2: u16 = 2;
 const RING_ON_MS: u32 = 1000;
 const RING_OFF_MS: u32 = 3000;
-const RING_TOTAL_MS_FOR_NUMBER_1: u32 = 4000;
-const RING_TOTAL_MS_FOR_NUMBER_2: u32 = 7000;
 const DIAL_TIMEOUT_MS: u32 = 3000;
 const OFFHOOK_IDLE_TIMEOUT_MS: u32 = 10000;
 const KEY_EVENT_GUARD_MS: u32 = 120;
@@ -101,6 +95,30 @@ const BUSY_LONG_ON_MS: u32 = 500;
 const BUSY_LONG_OFF_MS: u32 = 500;
 const BUSY_SHORT_ON_MS: u32 = 200;
 const BUSY_SHORT_OFF_MS: u32 = 200;
+
+struct Route {
+    digits: &'static [u8],
+    file_index: u16,
+    ring_total_ms: u32,
+}
+
+const ROUTES: &[Route] = &[
+    Route {
+        digits: b"5664",
+        file_index: 1,
+        ring_total_ms: 4000,
+    },
+    Route {
+        digits: b"88522222",
+        file_index: 2,
+        ring_total_ms: 7000,
+    },
+        Route {
+        digits: b"112",
+        file_index: 3,
+        ring_total_ms: 7500,
+    },
+];
 
 fn uart1_write_byte(tx: &mut stm32f1xx_hal::serial::Tx1, b: u8) {
     loop {
@@ -197,11 +215,11 @@ fn is_digit_key(key: char) -> bool {
 }
 
 fn is_valid_prefix(buf: &[u8]) -> bool {
-    NUMBER_1.starts_with(buf) || NUMBER_2.starts_with(buf)
+    ROUTES.iter().any(|r| r.digits.starts_with(buf))
 }
 
-fn is_valid_number(buf: &[u8]) -> bool {
-    buf == NUMBER_1 || buf == NUMBER_2
+fn find_exact_route(buf: &[u8]) -> Option<&'static Route> {
+    ROUTES.iter().find(|r| r.digits == buf)
 }
 
 fn busy_tone_on(now_ms: u32, busy_start_ms: u32) -> bool {
@@ -460,20 +478,16 @@ fn main() -> ! {
                     dial_len = 1;
                 }
 
-                if is_valid_number(&dial_buf[..dial_len]) {
-                    if &dial_buf[..dial_len] == NUMBER_1 {
-                        rprintln!("dial match 5664 -> ringing total 4s");
-                        ringing = true;
-                        ring_start_ms = now_ms;
-                        ring_total_ms = RING_TOTAL_MS_FOR_NUMBER_1;
-                        ring_answer_file_index = DF_ROOT_INDEX_FOR_NUMBER_1;
-                    } else {
-                        rprintln!("dial match 88522222 -> ringing total 7s");
-                        ringing = true;
-                        ring_start_ms = now_ms;
-                        ring_total_ms = RING_TOTAL_MS_FOR_NUMBER_2;
-                        ring_answer_file_index = DF_ROOT_INDEX_FOR_NUMBER_2;
-                    }
+                if let Some(route) = find_exact_route(&dial_buf[..dial_len]) {
+                    rprintln!(
+                        "dial match -> ringing total {}ms, file {}",
+                        route.ring_total_ms,
+                        route.file_index
+                    );
+                    ringing = true;
+                    ring_start_ms = now_ms;
+                    ring_total_ms = route.ring_total_ms;
+                    ring_answer_file_index = route.file_index;
                     dial_len = 0;
                     last_keypress_ms = now_ms;
                 } else if !is_valid_prefix(&dial_buf[..dial_len]) {
