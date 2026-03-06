@@ -89,6 +89,10 @@ const NUMBER_1: &[u8] = b"5664";
 const NUMBER_2: &[u8] = b"88522222";
 const DF_ROOT_INDEX_FOR_NUMBER_1: u16 = 1;
 const DF_ROOT_INDEX_FOR_NUMBER_2: u16 = 2;
+const RING_ON_MS: u32 = 1000;
+const RING_OFF_MS: u32 = 3000;
+const RING_TOTAL_MS_FOR_NUMBER_1: u32 = 4000;
+const RING_TOTAL_MS_FOR_NUMBER_2: u32 = 7000;
 const DIAL_TIMEOUT_MS: u32 = 3000;
 const OFFHOOK_IDLE_TIMEOUT_MS: u32 = 10000;
 const KEY_EVENT_GUARD_MS: u32 = 120;
@@ -209,6 +213,14 @@ fn busy_tone_on(now_ms: u32, busy_start_ms: u32) -> bool {
         let period = BUSY_SHORT_ON_MS + BUSY_SHORT_OFF_MS;
         (elapsed % period) < BUSY_SHORT_ON_MS
     }
+}
+
+fn ring_tone_on_for_total(elapsed_ms: u32, total_ms: u32, on_ms: u32, off_ms: u32) -> bool {
+    if elapsed_ms >= total_ms {
+        return false;
+    }
+    let period = on_ms + off_ms;
+    (elapsed_ms % period) < on_ms
 }
 
 struct Keypad4x4 {
@@ -355,6 +367,10 @@ fn main() -> ! {
     let mut tone_enabled = false;
     let mut dialing_started = false;
     let mut number_accepted = false;
+    let mut ringing = false;
+    let mut ring_start_ms: u32 = 0;
+    let mut ring_total_ms: u32 = 0;
+    let mut ring_answer_file_index: u16 = 0;
     let mut busy_mode = false;
     let mut busy_start_ms: u32 = 0;
     let mut now_ms: u32 = 0;
@@ -407,6 +423,10 @@ fn main() -> ! {
         if !handset_up {
             dialing_started = false;
             number_accepted = false;
+            ringing = false;
+            ring_start_ms = 0;
+            ring_total_ms = 0;
+            ring_answer_file_index = 0;
             busy_mode = false;
             dial_len = 0;
             last_keypress_ms = now_ms;
@@ -421,7 +441,7 @@ fn main() -> ! {
             && now_ms.wrapping_sub(last_digit_event_ms) >= KEY_EVENT_GUARD_MS;
         if handset_up && key_press_event {
             let key = pressed_key.unwrap();
-            if !busy_mode && !number_accepted && is_digit_key(key) {
+            if !busy_mode && !number_accepted && !ringing && is_digit_key(key) {
                 last_digit_event_ms = now_ms;
                 last_keypress_ms = now_ms;
                 rprintln!(
@@ -442,13 +462,18 @@ fn main() -> ! {
 
                 if is_valid_number(&dial_buf[..dial_len]) {
                     if &dial_buf[..dial_len] == NUMBER_1 {
-                        rprintln!("dial match 5664 -> play ROOT idx 1");
-                        dfplayer_play_root_index(&mut df_tx, DF_ROOT_INDEX_FOR_NUMBER_1);
+                        rprintln!("dial match 5664 -> ringing total 4s");
+                        ringing = true;
+                        ring_start_ms = now_ms;
+                        ring_total_ms = RING_TOTAL_MS_FOR_NUMBER_1;
+                        ring_answer_file_index = DF_ROOT_INDEX_FOR_NUMBER_1;
                     } else {
-                        rprintln!("dial match 88522222 -> play ROOT idx 2");
-                        dfplayer_play_root_index(&mut df_tx, DF_ROOT_INDEX_FOR_NUMBER_2);
+                        rprintln!("dial match 88522222 -> ringing total 7s");
+                        ringing = true;
+                        ring_start_ms = now_ms;
+                        ring_total_ms = RING_TOTAL_MS_FOR_NUMBER_2;
+                        ring_answer_file_index = DF_ROOT_INDEX_FOR_NUMBER_2;
                     }
-                    number_accepted = true;
                     dial_len = 0;
                     last_keypress_ms = now_ms;
                 } else if !is_valid_prefix(&dial_buf[..dial_len]) {
@@ -460,10 +485,24 @@ fn main() -> ! {
         }
         prev_pressed_key = pressed_key;
 
+        if handset_up && ringing {
+            let elapsed = now_ms.wrapping_sub(ring_start_ms);
+            if elapsed >= ring_total_ms {
+                ringing = false;
+                number_accepted = true;
+                rprintln!(
+                    "ringing done -> answer play ROOT idx {}",
+                    ring_answer_file_index
+                );
+                dfplayer_play_root_index(&mut df_tx, ring_answer_file_index);
+            }
+        }
+
         if handset_up
             && !dialing_started
             && !busy_mode
             && !number_accepted
+            && !ringing
             && now_ms.wrapping_sub(offhook_start_ms) >= OFFHOOK_IDLE_TIMEOUT_MS
         {
             rprintln!(
@@ -482,6 +521,7 @@ fn main() -> ! {
             && pressed_key.is_none()
             && !busy_mode
             && !number_accepted
+            && !ringing
         {
             if now_ms.wrapping_sub(last_keypress_ms) >= DIAL_TIMEOUT_MS {
                 rprintln!(
@@ -536,6 +576,13 @@ fn main() -> ! {
                     } else {
                         f_low
                     }
+                } else {
+                    0
+                }
+            } else if ringing {
+                let elapsed = now_ms.wrapping_sub(ring_start_ms);
+                if ring_tone_on_for_total(elapsed, ring_total_ms, RING_ON_MS, RING_OFF_MS) {
+                    425
                 } else {
                     0
                 }
