@@ -87,6 +87,7 @@ fn dtmf_frequencies(key: char) -> Option<(u32, u32)> {
 const SINGLE_TONE_KEYS: bool = true;
 const RING_ON_MS: u32 = 1000;
 const RING_OFF_MS: u32 = 3000;
+const OPTO_PULSE_MS: u32 = 5000;
 const DIAL_TIMEOUT_MS: u32 = 3000;
 const OFFHOOK_IDLE_TIMEOUT_MS: u32 = 10000;
 const KEY_EVENT_GUARD_MS: u32 = 120;
@@ -100,6 +101,7 @@ struct Route {
     digits: &'static [u8],
     file_index: u16,
     ring_total_ms: u32,
+    opto_channel: u8,
 }
 
 const ROUTES: &[Route] = &[
@@ -107,16 +109,19 @@ const ROUTES: &[Route] = &[
         digits: b"5664",
         file_index: 1,
         ring_total_ms: 4000,
+        opto_channel: 1,
     },
     Route {
         digits: b"88522222",
         file_index: 2,
         ring_total_ms: 7000,
+        opto_channel: 2,
     },
         Route {
         digits: b"112",
         file_index: 3,
         ring_total_ms: 7500,
+        opto_channel: 0,
     },
 ];
 
@@ -349,6 +354,11 @@ fn main() -> ! {
     let mut led = gpioc.pc13.into_push_pull_output(&mut gpioc.crh);
     // Internal pull-up enabled on PB12.
     let handset = gpiob.pb12.into_pull_up_input(&mut gpiob.crh);
+    // Optocouplers on PB8/PB9 (active-high).
+    let mut opto1 = gpiob.pb8.into_push_pull_output(&mut gpiob.crh);
+    let mut opto2 = gpiob.pb9.into_push_pull_output(&mut gpiob.crh);
+    let _ = opto1.set_low();
+    let _ = opto2.set_low();
     let _ = led.set_high();
 
     // UART1 on PA9/PA10 for DFPlayer Mini (9600 8N1).
@@ -406,6 +416,8 @@ fn main() -> ! {
     let mut df_parser = DfFrameParser::new();
     let mut dial_buf: [u8; 8] = [0; 8];
     let mut dial_len: usize = 0;
+    let mut opto1_start_ms: Option<u32> = None;
+    let mut opto2_start_ms: Option<u32> = None;
     rtt_init_print!();
     rprintln!("boot");
     // DFPlayer Mini init sequence: wait power-up, reset, select TF, then set volume.
@@ -465,6 +477,10 @@ fn main() -> ! {
             last_keypress_ms = now_ms;
             last_digit_event_ms = now_ms;
             prev_pressed_key = None;
+            opto1_start_ms = None;
+            opto2_start_ms = None;
+            let _ = opto1.set_low();
+            let _ = opto2.set_low();
         } else if pressed_key.is_some() {
             dialing_started = true;
         }
@@ -503,6 +519,11 @@ fn main() -> ! {
                     ring_start_ms = now_ms;
                     ring_total_ms = route.ring_total_ms;
                     ring_answer_file_index = route.file_index;
+                    if route.opto_channel == 1 {
+                        opto1_start_ms = Some(now_ms);
+                    } else if route.opto_channel == 2 {
+                        opto2_start_ms = Some(now_ms);
+                    }
                     dial_len = 0;
                     last_keypress_ms = now_ms;
                 } else if !is_valid_prefix(&dial_buf[..dial_len]) {
@@ -584,6 +605,31 @@ fn main() -> ! {
             last_handset_up = handset_up;
         }
         prev_handset_up = handset_up;
+
+        // Optocoupler pulse windows.
+        if handset_up {
+            if let Some(start) = opto1_start_ms {
+                if now_ms.wrapping_sub(start) < OPTO_PULSE_MS {
+                    let _ = opto1.set_high();
+                } else {
+                    let _ = opto1.set_low();
+                    opto1_start_ms = None;
+                }
+            } else {
+                let _ = opto1.set_low();
+            }
+
+            if let Some(start) = opto2_start_ms {
+                if now_ms.wrapping_sub(start) < OPTO_PULSE_MS {
+                    let _ = opto2.set_high();
+                } else {
+                    let _ = opto2.set_low();
+                    opto2_start_ms = None;
+                }
+            } else {
+                let _ = opto2.set_low();
+            }
+        }
 
         heartbeat = heartbeat.wrapping_add(1);
         if heartbeat % 1 == 0 {
