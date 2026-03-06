@@ -87,6 +87,8 @@ fn dtmf_frequencies(key: char) -> Option<(u32, u32)> {
 const SINGLE_TONE_KEYS: bool = true;
 const NUMBER_1: &[u8] = b"5664";
 const NUMBER_2: &[u8] = b"88522222";
+const DF_ROOT_INDEX_FOR_NUMBER_1: u16 = 1;
+const DF_ROOT_INDEX_FOR_NUMBER_2: u16 = 2;
 const DIAL_TIMEOUT_MS: u32 = 3000;
 const OFFHOOK_IDLE_TIMEOUT_MS: u32 = 10000;
 const KEY_EVENT_GUARD_MS: u32 = 120;
@@ -122,9 +124,9 @@ fn dfplayer_send_command(tx: &mut stm32f1xx_hal::serial::Tx1, cmd: u8, param: u1
     }
 }
 
-fn dfplayer_play_file(tx: &mut stm32f1xx_hal::serial::Tx1, file_index: u16) {
-    // Command 0x03: play track by index (root)
-    dfplayer_send_command(tx, 0x03, file_index);
+fn dfplayer_play_root_index(tx: &mut stm32f1xx_hal::serial::Tx1, index: u16) {
+    // Command 0x03: play track by index from root (FAT order dependent).
+    dfplayer_send_command(tx, 0x03, index);
 }
 
 fn delay_ms(timer: &mut SysCounterHz, ms: u32) {
@@ -440,11 +442,11 @@ fn main() -> ! {
 
                 if is_valid_number(&dial_buf[..dial_len]) {
                     if &dial_buf[..dial_len] == NUMBER_1 {
-                        rprintln!("dial match 5664 -> play 1");
-                        dfplayer_play_file(&mut df_tx, 1);
+                        rprintln!("dial match 5664 -> play ROOT idx 1");
+                        dfplayer_play_root_index(&mut df_tx, DF_ROOT_INDEX_FOR_NUMBER_1);
                     } else {
-                        rprintln!("dial match 88522222 -> play 2");
-                        dfplayer_play_file(&mut df_tx, 2);
+                        rprintln!("dial match 88522222 -> play ROOT idx 2");
+                        dfplayer_play_root_index(&mut df_tx, DF_ROOT_INDEX_FOR_NUMBER_2);
                     }
                     number_accepted = true;
                     dial_len = 0;
