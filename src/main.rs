@@ -12,7 +12,8 @@ use stm32f1xx_hal::{
     },
     pac,
     prelude::*,
-    timer::{Channel, Tim1NoRemap},
+    serial::{self},
+    timer::{Channel, SysCounterHz, Tim1NoRemap, Timer},
 };
 
 fn key_label(key: Option<char>) -> &'static str {
@@ -84,6 +85,129 @@ fn dtmf_frequencies(key: char) -> Option<(u32, u32)> {
 
 // Test mode: output a single clean tone per key (no dual-tone multiplexing).
 const SINGLE_TONE_KEYS: bool = true;
+const NUMBER_1: &[u8] = b"5664";
+const NUMBER_2: &[u8] = b"88522222";
+const DIAL_TIMEOUT_MS: u32 = 3000;
+const OFFHOOK_IDLE_TIMEOUT_MS: u32 = 10000;
+const KEY_EVENT_GUARD_MS: u32 = 120;
+const BUSY_STAGE_SWITCH_MS: u32 = 12000;
+const BUSY_LONG_ON_MS: u32 = 500;
+const BUSY_LONG_OFF_MS: u32 = 500;
+const BUSY_SHORT_ON_MS: u32 = 200;
+const BUSY_SHORT_OFF_MS: u32 = 200;
+
+fn uart1_write_byte(tx: &mut stm32f1xx_hal::serial::Tx1, b: u8) {
+    loop {
+        if tx.write_u8(b).is_ok() {
+            break;
+        }
+    }
+}
+
+fn dfplayer_send_command(tx: &mut stm32f1xx_hal::serial::Tx1, cmd: u8, param: u16) {
+    let version: u8 = 0xFF;
+    let len: u8 = 0x06;
+    let ack: u8 = 0x00;
+    let param_h = (param >> 8) as u8;
+    let param_l = (param & 0xFF) as u8;
+
+    let sum = version as u16 + len as u16 + cmd as u16 + ack as u16 + param_h as u16 + param_l as u16;
+    let checksum = 0u16.wrapping_sub(sum);
+    let c_h = (checksum >> 8) as u8;
+    let c_l = (checksum & 0xFF) as u8;
+
+    let frame = [0x7E, version, len, cmd, ack, param_h, param_l, c_h, c_l, 0xEF];
+    for b in frame {
+        uart1_write_byte(tx, b);
+    }
+}
+
+fn dfplayer_play_file(tx: &mut stm32f1xx_hal::serial::Tx1, file_index: u16) {
+    // Command 0x03: play track by index (root)
+    dfplayer_send_command(tx, 0x03, file_index);
+}
+
+fn delay_ms(timer: &mut SysCounterHz, ms: u32) {
+    for _ in 0..ms {
+        loop {
+            if timer.wait().is_ok() {
+                break;
+            }
+        }
+    }
+}
+
+struct DfFrameParser {
+    buf: [u8; 10],
+    idx: usize,
+    in_frame: bool,
+}
+
+impl DfFrameParser {
+    fn new() -> Self {
+        Self {
+            buf: [0; 10],
+            idx: 0,
+            in_frame: false,
+        }
+    }
+
+    fn push(&mut self, b: u8) -> Option<(u8, u16)> {
+        if !self.in_frame {
+            if b == 0x7E {
+                self.in_frame = true;
+                self.idx = 0;
+                self.buf[self.idx] = b;
+                self.idx += 1;
+            }
+            return None;
+        }
+
+        if self.idx < self.buf.len() {
+            self.buf[self.idx] = b;
+            self.idx += 1;
+        } else {
+            self.in_frame = false;
+            self.idx = 0;
+            return None;
+        }
+
+        if self.idx == 10 {
+            self.in_frame = false;
+            self.idx = 0;
+            if self.buf[0] == 0x7E && self.buf[9] == 0xEF {
+                let cmd = self.buf[3];
+                let param = ((self.buf[5] as u16) << 8) | self.buf[6] as u16;
+                return Some((cmd, param));
+            }
+        }
+
+        None
+    }
+}
+
+fn is_digit_key(key: char) -> bool {
+    matches!(key, '0'..='9')
+}
+
+fn is_valid_prefix(buf: &[u8]) -> bool {
+    NUMBER_1.starts_with(buf) || NUMBER_2.starts_with(buf)
+}
+
+fn is_valid_number(buf: &[u8]) -> bool {
+    buf == NUMBER_1 || buf == NUMBER_2
+}
+
+fn busy_tone_on(now_ms: u32, busy_start_ms: u32) -> bool {
+    let elapsed = now_ms.wrapping_sub(busy_start_ms);
+    if elapsed < BUSY_STAGE_SWITCH_MS {
+        let period = BUSY_LONG_ON_MS + BUSY_LONG_OFF_MS;
+        (elapsed % period) < BUSY_LONG_ON_MS
+    } else {
+        let period = BUSY_SHORT_ON_MS + BUSY_SHORT_OFF_MS;
+        (elapsed % period) < BUSY_SHORT_ON_MS
+    }
+}
 
 struct Keypad4x4 {
     r0: PA7<Output<PushPull>>,
@@ -173,6 +297,7 @@ impl Keypad4x4 {
 
 #[entry]
 fn main() -> ! {
+    let cp = cortex_m::Peripherals::take().unwrap();
     let dp = pac::Peripherals::take().unwrap();
 
     let mut rcc = dp.RCC.constrain();
@@ -180,12 +305,24 @@ fn main() -> ! {
     let mut gpioa = dp.GPIOA.split(&mut rcc);
     let mut gpiob = dp.GPIOB.split(&mut rcc);
     let mut gpioc = dp.GPIOC.split(&mut rcc);
+    let mut systick = Timer::syst(cp.SYST, &rcc.clocks).counter_hz();
+    let _ = systick.start(1000.Hz());
 
     // Blue Pill PC13 LED is active-low: set low => LED on, high => LED off.
     let mut led = gpioc.pc13.into_push_pull_output(&mut gpioc.crh);
     // Internal pull-up enabled on PB12.
     let handset = gpiob.pb12.into_pull_up_input(&mut gpiob.crh);
     let _ = led.set_high();
+
+    // UART1 on PA9/PA10 for DFPlayer Mini (9600 8N1).
+    let tx_pin = gpioa.pa9.into_alternate_push_pull(&mut gpioa.crh);
+    let rx_pin = gpioa.pa10;
+    let serial = dp.USART1.serial(
+        (tx_pin, rx_pin),
+        serial::Config::default().baudrate(9600.bps()),
+        &mut rcc,
+    );
+    let (mut df_tx, mut df_rx) = serial.split();
 
     // Tone output on PA8 (TIM1_CH1) for line tone + DTMF.
     let tone_pin = gpioa.pa8.into_alternate_push_pull(&mut gpioa.crh);
@@ -215,16 +352,146 @@ fn main() -> ! {
     let mut current_tone_duty: u16 = 0;
     let mut tone_enabled = false;
     let mut dialing_started = false;
+    let mut number_accepted = false;
+    let mut busy_mode = false;
+    let mut busy_start_ms: u32 = 0;
+    let mut now_ms: u32 = 0;
+    let mut offhook_start_ms: u32 = 0;
+    let mut last_keypress_ms: u32 = 0;
+    let mut last_digit_event_ms: u32 = 0;
+    let mut prev_pressed_key: Option<char> = None;
+    let mut prev_handset_up: bool = false;
+    let mut df_parser = DfFrameParser::new();
+    let mut dial_buf: [u8; 8] = [0; 8];
+    let mut dial_len: usize = 0;
     rtt_init_print!();
     rprintln!("boot");
+    // DFPlayer Mini init sequence: wait power-up, reset, select TF, then set volume.
+    // Helps with unreliable startup on some modules/clones.
+    delay_ms(&mut systick, 1000);
+    dfplayer_send_command(&mut df_tx, 0x0C, 0); // reset
+    delay_ms(&mut systick, 1200);
+    dfplayer_send_command(&mut df_tx, 0x09, 2); // select TF card
+    delay_ms(&mut systick, 200);
+    dfplayer_send_command(&mut df_tx, 0x06, 18); // volume 0..30
+    delay_ms(&mut systick, 200);
 
     loop {
+        if systick.wait().is_ok() {
+            now_ms = now_ms.wrapping_add(1);
+        }
+
+        loop {
+            match df_rx.read() {
+                Ok(b) => {
+                    if let Some((cmd, param)) = df_parser.push(b) {
+                        if cmd == 0x3D {
+                            rprintln!("dfplayer: track finished param={}", param);
+                        } else {
+                            rprintln!("dfplayer: cmd=0x{:x} param={}", cmd, param);
+                        }
+                    }
+                }
+                Err(nb::Error::WouldBlock) => break,
+                Err(_) => break,
+            }
+        }
+
         let pressed_key = remap_key(keypad.scan_key());
         let handset_up = handset.is_high();
+        if handset_up && !prev_handset_up {
+            offhook_start_ms = now_ms;
+        }
         if !handset_up {
             dialing_started = false;
+            number_accepted = false;
+            busy_mode = false;
+            dial_len = 0;
+            last_keypress_ms = now_ms;
+            last_digit_event_ms = now_ms;
+            prev_pressed_key = None;
         } else if pressed_key.is_some() {
             dialing_started = true;
+        }
+
+        let key_press_event_raw = pressed_key.is_some() && prev_pressed_key.is_none();
+        let key_press_event = key_press_event_raw
+            && now_ms.wrapping_sub(last_digit_event_ms) >= KEY_EVENT_GUARD_MS;
+        if handset_up && key_press_event {
+            let key = pressed_key.unwrap();
+            if !busy_mode && !number_accepted && is_digit_key(key) {
+                last_digit_event_ms = now_ms;
+                last_keypress_ms = now_ms;
+                rprintln!(
+                    "digit event key={} now_ms={} last_keypress_ms={} dial_len={}",
+                    key,
+                    now_ms,
+                    last_keypress_ms,
+                    dial_len
+                );
+                if dial_len < dial_buf.len() {
+                    dial_buf[dial_len] = key as u8;
+                    dial_len += 1;
+                } else {
+                    // Buffer full: start a fresh number with current digit.
+                    dial_buf[0] = key as u8;
+                    dial_len = 1;
+                }
+
+                if is_valid_number(&dial_buf[..dial_len]) {
+                    if &dial_buf[..dial_len] == NUMBER_1 {
+                        rprintln!("dial match 5664 -> play 1");
+                        dfplayer_play_file(&mut df_tx, 1);
+                    } else {
+                        rprintln!("dial match 88522222 -> play 2");
+                        dfplayer_play_file(&mut df_tx, 2);
+                    }
+                    number_accepted = true;
+                    dial_len = 0;
+                    last_keypress_ms = now_ms;
+                } else if !is_valid_prefix(&dial_buf[..dial_len]) {
+                    // Do not trigger busy immediately on wrong prefix.
+                    // Keep collecting until timeout after the last entered digit.
+                    rprintln!("invalid prefix, waiting timeout");
+                }
+            }
+        }
+        prev_pressed_key = pressed_key;
+
+        if handset_up
+            && !dialing_started
+            && !busy_mode
+            && !number_accepted
+            && now_ms.wrapping_sub(offhook_start_ms) >= OFFHOOK_IDLE_TIMEOUT_MS
+        {
+            rprintln!(
+                "offhook idle timeout -> busy now_ms={} offhook_start_ms={} delta={}",
+                now_ms,
+                offhook_start_ms,
+                now_ms.wrapping_sub(offhook_start_ms)
+            );
+            busy_mode = true;
+            busy_start_ms = now_ms;
+        }
+
+        if handset_up
+            && dialing_started
+            && dial_len > 0
+            && pressed_key.is_none()
+            && !busy_mode
+            && !number_accepted
+        {
+            if now_ms.wrapping_sub(last_keypress_ms) >= DIAL_TIMEOUT_MS {
+                rprintln!(
+                    "dial timeout/wrong -> busy now_ms={} last_keypress_ms={} delta={} dial_len={}",
+                    now_ms,
+                    last_keypress_ms,
+                    now_ms.wrapping_sub(last_keypress_ms),
+                    dial_len
+                );
+                busy_mode = true;
+                busy_start_ms = now_ms;
+            }
         }
 
         // Blue Pill LED is active-low, so:
@@ -244,6 +511,7 @@ fn main() -> ! {
             last_key = pressed_key;
             last_handset_up = handset_up;
         }
+        prev_handset_up = handset_up;
 
         heartbeat = heartbeat.wrapping_add(1);
         if heartbeat % 1 == 0 {
@@ -251,7 +519,13 @@ fn main() -> ! {
         }
 
         let desired_tone_hz = if handset_up {
-            if let Some(key) = pressed_key {
+            if busy_mode {
+                if busy_tone_on(now_ms, busy_start_ms) {
+                    425
+                } else {
+                    0
+                }
+            } else if let Some(key) = pressed_key {
                 if let Some((f_low, f_high)) = dtmf_frequencies(key) {
                     if SINGLE_TONE_KEYS {
                         f_low
@@ -263,6 +537,8 @@ fn main() -> ! {
                 } else {
                     0
                 }
+            } else if number_accepted {
+                0
             } else if !dialing_started {
                 // Line tone only before first key press.
                 425
@@ -272,7 +548,9 @@ fn main() -> ! {
         } else {
             0
         };
-        let desired_tone_duty = if handset_up && pressed_key.is_none() && !dialing_started {
+        let desired_tone_duty = if busy_mode {
+            tone_max / 32
+        } else if handset_up && pressed_key.is_none() && !dialing_started {
             // Lower line tone level for handset path.
             tone_max / 32
         } else {

@@ -8,6 +8,7 @@ cortex-m = "0.7"
 cortex-m-rt = "0.7"
 panic-halt = "0.2"
 rtt-target = "0.6"
+nb = "1"
 
 [dependencies.stm32f1xx-hal]
 version = "0.11"
