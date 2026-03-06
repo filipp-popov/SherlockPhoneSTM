@@ -12,6 +12,7 @@ use stm32f1xx_hal::{
     },
     pac,
     prelude::*,
+    timer::{Channel, Tim1NoRemap},
 };
 
 fn key_label(key: Option<char>) -> &'static str {
@@ -58,6 +59,31 @@ fn remap_key(raw: Option<char>) -> Option<char> {
         _ => raw,
     }
 }
+
+fn dtmf_frequencies(key: char) -> Option<(u32, u32)> {
+    match key {
+        '1' => Some((697, 1209)),
+        '2' => Some((697, 1336)),
+        '3' => Some((697, 1477)),
+        'A' => Some((697, 1633)),
+        '4' => Some((770, 1209)),
+        '5' => Some((770, 1336)),
+        '6' => Some((770, 1477)),
+        'B' => Some((770, 1633)),
+        '7' => Some((852, 1209)),
+        '8' => Some((852, 1336)),
+        '9' => Some((852, 1477)),
+        'C' => Some((852, 1633)),
+        '*' => Some((941, 1209)),
+        '0' => Some((941, 1336)),
+        '#' => Some((941, 1477)),
+        'D' => Some((941, 1633)),
+        _ => None,
+    }
+}
+
+// Test mode: output a single clean tone per key (no dual-tone multiplexing).
+const SINGLE_TONE_KEYS: bool = true;
 
 struct Keypad4x4 {
     r0: PA7<Output<PushPull>>,
@@ -150,6 +176,7 @@ fn main() -> ! {
     let dp = pac::Peripherals::take().unwrap();
 
     let mut rcc = dp.RCC.constrain();
+    let mut afio = dp.AFIO.constrain(&mut rcc);
     let mut gpioa = dp.GPIOA.split(&mut rcc);
     let mut gpiob = dp.GPIOB.split(&mut rcc);
     let mut gpioc = dp.GPIOC.split(&mut rcc);
@@ -159,6 +186,15 @@ fn main() -> ! {
     // Internal pull-up enabled on PB12.
     let handset = gpiob.pb12.into_pull_up_input(&mut gpiob.crh);
     let _ = led.set_high();
+
+    // Tone output on PA8 (TIM1_CH1) for line tone + DTMF.
+    let tone_pin = gpioa.pa8.into_alternate_push_pull(&mut gpioa.crh);
+    let mut tone_pwm = dp
+        .TIM1
+        .pwm_hz::<Tim1NoRemap, _, _>(tone_pin, &mut afio.mapr, 425.Hz(), &mut rcc);
+    tone_pwm.enable(Channel::C1);
+    let tone_max = tone_pwm.get_max_duty();
+    tone_pwm.set_duty(Channel::C1, 0);
 
     let mut keypad = Keypad4x4 {
         r0: gpioa.pa7.into_push_pull_output(&mut gpioa.crl),
@@ -174,12 +210,22 @@ fn main() -> ! {
     let mut last_key: Option<char> = None;
     let mut last_handset_up: bool = false;
     let mut heartbeat: u32 = 0;
+    let mut dtmf_phase_high = false;
+    let mut current_tone_hz: u32 = 0;
+    let mut current_tone_duty: u16 = 0;
+    let mut tone_enabled = false;
+    let mut dialing_started = false;
     rtt_init_print!();
     rprintln!("boot");
 
     loop {
         let pressed_key = remap_key(keypad.scan_key());
         let handset_up = handset.is_high();
+        if !handset_up {
+            dialing_started = false;
+        } else if pressed_key.is_some() {
+            dialing_started = true;
+        }
 
         // Blue Pill LED is active-low, so:
         // HIGH => LED on, LOW => LED off.
@@ -200,13 +246,61 @@ fn main() -> ! {
         }
 
         heartbeat = heartbeat.wrapping_add(1);
-        if heartbeat % 200_000 == 0 {
-            rprintln!(
-                "alive key={} handset_up={}",
-                key_label(pressed_key),
-                handset_up
-            );
+        if heartbeat % 1 == 0 {
+            dtmf_phase_high = !dtmf_phase_high;
         }
+
+        let desired_tone_hz = if handset_up {
+            if let Some(key) = pressed_key {
+                if let Some((f_low, f_high)) = dtmf_frequencies(key) {
+                    if SINGLE_TONE_KEYS {
+                        f_low
+                    } else if dtmf_phase_high {
+                        f_high
+                    } else {
+                        f_low
+                    }
+                } else {
+                    0
+                }
+            } else if !dialing_started {
+                // Line tone only before first key press.
+                425
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let desired_tone_duty = if handset_up && pressed_key.is_none() && !dialing_started {
+            // Lower line tone level for handset path.
+            tone_max / 32
+        } else {
+            // Lower DTMF level for handset path.
+            tone_max / 32
+        };
+
+        if desired_tone_hz == 0 {
+            if tone_enabled {
+                tone_pwm.set_duty(Channel::C1, 0);
+                tone_enabled = false;
+                current_tone_hz = 0;
+                current_tone_duty = 0;
+            }
+        } else {
+            if desired_tone_hz != current_tone_hz {
+                tone_pwm.set_period(desired_tone_hz.Hz());
+                current_tone_hz = desired_tone_hz;
+            }
+            if !tone_enabled || desired_tone_duty != current_tone_duty {
+                tone_pwm.set_duty(Channel::C1, desired_tone_duty);
+                current_tone_duty = desired_tone_duty;
+            }
+            if !tone_enabled {
+                tone_enabled = true;
+            }
+        }
+
         asm::nop();
     }
 }
