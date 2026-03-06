@@ -151,6 +151,11 @@ fn dfplayer_play_root_index(tx: &mut stm32f1xx_hal::serial::Tx1, index: u16) {
     dfplayer_send_command(tx, 0x03, index);
 }
 
+fn dfplayer_stop(tx: &mut stm32f1xx_hal::serial::Tx1) {
+    // Command 0x16: stop playback.
+    dfplayer_send_command(tx, 0x16, 0);
+}
+
 fn delay_ms(timer: &mut SysCounterHz, ms: u32) {
     for _ in 0..ms {
         loop {
@@ -389,6 +394,7 @@ fn main() -> ! {
     let mut ring_start_ms: u32 = 0;
     let mut ring_total_ms: u32 = 0;
     let mut ring_answer_file_index: u16 = 0;
+    let mut playing = false;
     let mut busy_mode = false;
     let mut busy_start_ms: u32 = 0;
     let mut now_ms: u32 = 0;
@@ -423,6 +429,7 @@ fn main() -> ! {
                     if let Some((cmd, param)) = df_parser.push(b) {
                         if cmd == 0x3D {
                             rprintln!("dfplayer: track finished param={}", param);
+                            playing = false;
                         } else {
                             rprintln!("dfplayer: cmd=0x{:x} param={}", cmd, param);
                         }
@@ -437,6 +444,14 @@ fn main() -> ! {
         let handset_up = handset.is_high();
         if handset_up && !prev_handset_up {
             offhook_start_ms = now_ms;
+        }
+        if !handset_up && prev_handset_up {
+            // On handset down, force stop any playing track.
+            if playing {
+                rprintln!("handset down -> stop playback");
+                dfplayer_stop(&mut df_tx);
+                playing = false;
+            }
         }
         if !handset_up {
             dialing_started = false;
@@ -459,7 +474,7 @@ fn main() -> ! {
             && now_ms.wrapping_sub(last_digit_event_ms) >= KEY_EVENT_GUARD_MS;
         if handset_up && key_press_event {
             let key = pressed_key.unwrap();
-            if !busy_mode && !number_accepted && !ringing && is_digit_key(key) {
+            if !busy_mode && !number_accepted && !ringing && !playing && is_digit_key(key) {
                 last_digit_event_ms = now_ms;
                 last_keypress_ms = now_ms;
                 rprintln!(
@@ -509,6 +524,7 @@ fn main() -> ! {
                     ring_answer_file_index
                 );
                 dfplayer_play_root_index(&mut df_tx, ring_answer_file_index);
+                playing = true;
             }
         }
 
@@ -581,6 +597,9 @@ fn main() -> ! {
                 } else {
                     0
                 }
+            } else if playing {
+                // Ignore keypad tones while file is playing.
+                0
             } else if let Some(key) = pressed_key {
                 if let Some((f_low, f_high)) = dtmf_frequencies(key) {
                     if SINGLE_TONE_KEYS {
