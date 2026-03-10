@@ -16,6 +16,23 @@ use stm32f1xx_hal::{
     timer::{Channel, SysCounterHz, Tim1NoRemap, Timer},
 };
 
+const LOG_ENABLED: bool = false;
+const KEY_REMAP_ENABLED: bool = true;
+
+macro_rules! logln {
+    ($($arg:tt)*) => {
+        if LOG_ENABLED {
+            rprintln!($($arg)*);
+        }
+    };
+}
+
+fn init_logs() {
+    if LOG_ENABLED {
+        rtt_init_print!();
+    }
+}
+
 fn key_label(key: Option<char>) -> &'static str {
     match key {
         Some('1') => "1",
@@ -40,6 +57,9 @@ fn key_label(key: Option<char>) -> &'static str {
 }
 
 fn remap_key(raw: Option<char>) -> Option<char> {
+    if !KEY_REMAP_ENABLED {
+        return raw;
+    }
     match raw {
         Some('5') => Some('1'),
         Some('4') => Some('2'),
@@ -117,12 +137,12 @@ const ROUTES: &[Route] = &[
         ring_total_ms: 7000,
         opto_channel: 2,
     },
-        Route {
-        digits: b"112",
-        file_index: 3,
-        ring_total_ms: 7500,
-        opto_channel: 0,
-    },
+    //     Route {
+    //     digits: b"112",
+    //     file_index: 3,
+    //     ring_total_ms: 7500,
+    //     opto_channel: 0,
+    // },
 ];
 
 fn uart1_write_byte(tx: &mut stm32f1xx_hal::serial::Tx1, b: u8) {
@@ -263,6 +283,15 @@ struct Keypad4x4 {
 }
 
 impl Keypad4x4 {
+    #[inline(always)]
+    fn row_settle() {
+        // In --release the scan loop is much faster; give GPIO matrix lines
+        // a short settle time before sampling columns.
+        for _ in 0..48 {
+            asm::nop();
+        }
+    }
+
     fn set_all_rows_high(&mut self) {
         let _ = self.r0.set_high();
         let _ = self.r1.set_high();
@@ -274,6 +303,7 @@ impl Keypad4x4 {
         self.set_all_rows_high();
 
         let _ = self.r0.set_low();
+        Self::row_settle();
         if self.c0.is_low() {
             return Some('1');
         }
@@ -289,6 +319,7 @@ impl Keypad4x4 {
         let _ = self.r0.set_high();
 
         let _ = self.r1.set_low();
+        Self::row_settle();
         if self.c0.is_low() {
             return Some('4');
         }
@@ -304,6 +335,7 @@ impl Keypad4x4 {
         let _ = self.r1.set_high();
 
         let _ = self.r2.set_low();
+        Self::row_settle();
         if self.c0.is_low() {
             return Some('7');
         }
@@ -319,6 +351,7 @@ impl Keypad4x4 {
         let _ = self.r2.set_high();
 
         let _ = self.r3.set_low();
+        Self::row_settle();
         if self.c0.is_low() {
             return Some('*');
         }
@@ -418,8 +451,8 @@ fn main() -> ! {
     let mut dial_len: usize = 0;
     let mut opto1_start_ms: Option<u32> = None;
     let mut opto2_start_ms: Option<u32> = None;
-    rtt_init_print!();
-    rprintln!("boot");
+    init_logs();
+    logln!("boot");
     // DFPlayer Mini init sequence: wait power-up, reset, select TF, then set volume.
     // Helps with unreliable startup on some modules/clones.
     delay_ms(&mut systick, 1000);
@@ -440,10 +473,10 @@ fn main() -> ! {
                 Ok(b) => {
                     if let Some((cmd, param)) = df_parser.push(b) {
                         if cmd == 0x3D {
-                            rprintln!("dfplayer: track finished param={}", param);
+                            logln!("dfplayer: track finished param={}", param);
                             playing = false;
                         } else {
-                            rprintln!("dfplayer: cmd=0x{:x} param={}", cmd, param);
+                            logln!("dfplayer: cmd=0x{:x} param={}", cmd, param);
                         }
                     }
                 }
@@ -460,7 +493,7 @@ fn main() -> ! {
         if !handset_up && prev_handset_up {
             // On handset down, force stop any playing track.
             if playing {
-                rprintln!("handset down -> stop playback");
+                logln!("handset down -> stop playback");
                 dfplayer_stop(&mut df_tx);
                 playing = false;
             }
@@ -493,7 +526,7 @@ fn main() -> ! {
             if !busy_mode && !number_accepted && !ringing && !playing && is_digit_key(key) {
                 last_digit_event_ms = now_ms;
                 last_keypress_ms = now_ms;
-                rprintln!(
+                logln!(
                     "digit event key={} now_ms={} last_keypress_ms={} dial_len={}",
                     key,
                     now_ms,
@@ -510,7 +543,7 @@ fn main() -> ! {
                 }
 
                 if let Some(route) = find_exact_route(&dial_buf[..dial_len]) {
-                    rprintln!(
+                    logln!(
                         "dial match -> ringing total {}ms, file {}",
                         route.ring_total_ms,
                         route.file_index
@@ -529,7 +562,7 @@ fn main() -> ! {
                 } else if !is_valid_prefix(&dial_buf[..dial_len]) {
                     // Do not trigger busy immediately on wrong prefix.
                     // Keep collecting until timeout after the last entered digit.
-                    rprintln!("invalid prefix, waiting timeout");
+                    logln!("invalid prefix, waiting timeout");
                 }
             }
         }
@@ -540,7 +573,7 @@ fn main() -> ! {
             if elapsed >= ring_total_ms {
                 ringing = false;
                 number_accepted = true;
-                rprintln!(
+                logln!(
                     "ringing done -> answer play ROOT idx {}",
                     ring_answer_file_index
                 );
@@ -556,7 +589,7 @@ fn main() -> ! {
             && !ringing
             && now_ms.wrapping_sub(offhook_start_ms) >= OFFHOOK_IDLE_TIMEOUT_MS
         {
-            rprintln!(
+            logln!(
                 "offhook idle timeout -> busy now_ms={} offhook_start_ms={} delta={}",
                 now_ms,
                 offhook_start_ms,
@@ -575,7 +608,7 @@ fn main() -> ! {
             && !ringing
         {
             if now_ms.wrapping_sub(last_keypress_ms) >= DIAL_TIMEOUT_MS {
-                rprintln!(
+                logln!(
                     "dial timeout/wrong -> busy now_ms={} last_keypress_ms={} delta={} dial_len={}",
                     now_ms,
                     last_keypress_ms,
@@ -596,7 +629,7 @@ fn main() -> ! {
         }
 
         if pressed_key != last_key || handset_up != last_handset_up {
-            rprintln!(
+            logln!(
                 "key={} handset_up={}",
                 key_label(pressed_key),
                 handset_up
