@@ -126,15 +126,15 @@ struct Route {
 
 const ROUTES: &[Route] = &[
     Route {
-        digits: b"5664",
+        digits: b"5668",
         file_index: 1,
         ring_total_ms: 4000,
         opto_channel: 1,
     },
     Route {
-        digits: b"88522222",
+        digits: b"1123",
         file_index: 2,
-        ring_total_ms: 7000,
+        ring_total_ms: 12000,
         opto_channel: 2,
     },
     //     Route {
